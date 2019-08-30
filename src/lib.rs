@@ -1,6 +1,7 @@
 //! Hyper SSL support via OpenSSL.
 #![warn(missing_docs)]
 #![doc(html_root_url = "https://docs.rs/hyper-openssl/0.7")]
+#![feature(type_alias_impl_trait)]
 
 extern crate antidote;
 extern crate bytes;
@@ -19,7 +20,6 @@ extern crate tokio;
 
 use antidote::Mutex;
 use bytes::{Buf, BufMut};
-use futures::{Async, Future, Poll};
 use hyper::client::connect::{Connect, Connected, Destination};
 #[cfg(feature = "runtime")]
 use hyper::client::HttpConnector;
@@ -30,11 +30,13 @@ use openssl::ssl::{
 };
 use std::error::Error;
 use std::fmt::Debug;
-use std::io::{self, Read, Write};
-use std::mem;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_openssl::{ConnectAsync, ConnectConfigurationExt, SslStream};
+use tokio_openssl::SslStream;
 
 use cache::{SessionCache, SessionKey};
 
@@ -52,7 +54,9 @@ struct Inner {
     ssl: SslConnector,
     cache: Arc<Mutex<SessionCache>>,
     callback: Option<
-        Arc<Fn(&mut ConnectConfiguration, &Destination) -> Result<(), ErrorStack> + Sync + Send>,
+        Arc<
+            dyn Fn(&mut ConnectConfiguration, &Destination) -> Result<(), ErrorStack> + Sync + Send,
+        >,
     >,
 }
 
@@ -96,8 +100,8 @@ impl HttpsConnector<HttpConnector> {
     /// HTTP/2 and HTTP/1.1.
     ///
     /// Requires the `runtime` Cargo feature.
-    pub fn new(threads: usize) -> Result<HttpsConnector<HttpConnector>, ErrorStack> {
-        let mut http = HttpConnector::new(threads);
+    pub fn new() -> Result<HttpsConnector<HttpConnector>, ErrorStack> {
+        let mut http = HttpConnector::new();
         http.enforce_http(false);
         let mut ssl = SslConnector::builder(SslMethod::tls())?;
         // avoid unused_mut warnings when building against OpenSSL 1.0.1
@@ -168,10 +172,12 @@ where
     T::Transport: Debug + Sync + Send,
 {
     type Transport = MaybeHttpsStream<T::Transport>;
-    type Error = Box<Error + Sync + Send>;
+
+    type Error = Box<dyn Error + Sync + Send>;
+
     type Future = ConnectFuture<T>;
 
-    fn connect(&self, destination: Destination) -> ConnectFuture<T> {
+    fn connect(&self, destination: Destination) -> Self::Future {
         let tls_setup = if destination.scheme() == "https" {
             Some((self.inner.clone(), destination.clone()))
         } else {
@@ -180,94 +186,46 @@ where
 
         let conn = self.http.connect(destination);
 
-        ConnectFuture(ConnectState::InnerConnect { conn, tls_setup })
+        // TODO: why does Connect requires its future to be Unpin? For now lets just pin box it.
+        Box::pin(connect::<T>(conn, tls_setup))
     }
 }
 
-enum ConnectState<T>
-where
-    T: Connect,
-{
-    InnerConnect {
-        conn: T::Future,
-        tls_setup: Option<(Inner, Destination)>,
-    },
-    Handshake {
-        handshake: ConnectAsync<T::Transport>,
-        connected: Connected,
-    },
-    Terminal,
-}
+type ConnectFuture<T: Connect> = impl Future<
+        Output = Result<(MaybeHttpsStream<T::Transport>, Connected), Box<dyn Error + Sync + Send>>,
+    > + Unpin
+    + Send;
 
-/// A future connecting to a remote HTTP server.
-pub struct ConnectFuture<T>(ConnectState<T>)
-where
-    T: Connect;
-
-impl<T> Future for ConnectFuture<T>
+async fn connect<T>(
+    conn: T::Future,
+    tls_setup: Option<(Inner, Destination)>,
+) -> Result<(MaybeHttpsStream<T::Transport>, Connected), Box<dyn Error + Sync + Send>>
 where
     T: Connect,
     T::Transport: Debug + Sync + Send,
 {
-    type Item = (MaybeHttpsStream<T::Transport>, Connected);
-    type Error = Box<Error + Sync + Send>;
+    let (stream, mut connected) = match conn.await {
+        Ok((stream, connected)) => (stream, connected),
+        Err(error) => return Err(error.into()),
+    };
+    match tls_setup {
+        Some((inner, destination)) => {
+            let ssl = inner.setup_ssl(&destination)?;
+            let handshake = tokio_openssl::connect(ssl, destination.host(), stream);
+            let stream = handshake.await?;
 
-    fn poll(
-        &mut self,
-    ) -> Poll<(MaybeHttpsStream<T::Transport>, Connected), Box<Error + Sync + Send>> {
-        loop {
-            match mem::replace(&mut self.0, ConnectState::Terminal) {
-                ConnectState::InnerConnect {
-                    mut conn,
-                    tls_setup,
-                } => match conn.poll() {
-                    Ok(Async::Ready((stream, connected))) => match tls_setup {
-                        Some((inner, destination)) => {
-                            let ssl = inner.setup_ssl(&destination)?;
-                            let handshake = ssl.connect_async(destination.host(), stream);
-                            self.0 = ConnectState::Handshake {
-                                handshake,
-                                connected,
-                            };
-                        }
-                        None => {
-                            return Ok(Async::Ready((MaybeHttpsStream::Http(stream), connected)));
-                        }
-                    },
-                    Ok(Async::NotReady) => {
-                        self.0 = ConnectState::InnerConnect { conn, tls_setup };
-                        return Ok(Async::NotReady);
-                    }
-                    Err(e) => return Err(e.into()),
-                },
-                ConnectState::Handshake {
-                    mut handshake,
-                    mut connected,
-                } => match handshake.poll() {
-                    Ok(Async::Ready(stream)) => {
-                        // avoid unused_mut warnings on OpenSSL 1.0.1
-                        connected = connected;
+            // avoid unused_mut warnings on OpenSSL 1.0.1
+            connected = connected;
 
-                        #[cfg(ossl102)]
-                        {
-                            if let Some(b"h2") = stream.get_ref().ssl().selected_alpn_protocol() {
-                                connected = connected.negotiated_h2();
-                            }
-                        }
-                        return Ok(Async::Ready((MaybeHttpsStream::Https(stream), connected)));
-                    }
-                    Ok(Async::NotReady) => {
-                        self.0 = ConnectState::Handshake {
-                            handshake,
-                            connected,
-                        };
-                        return Ok(Async::NotReady);
-                    }
-                    Err(e) => return Err(e.into()),
-                },
-                ConnectState::Terminal => panic!("future polled after completion"),
-            };
+            #[cfg(ossl102)]
+            {
+                if let Some(b"h2") = stream.ssl().selected_alpn_protocol() {
+                    connected = connected.negotiated_h2();
+                }
+            }
+            return Ok((MaybeHttpsStream::Https(stream), connected));
         }
+        None => return Ok((MaybeHttpsStream::Http(stream), connected)),
     }
 }
 
@@ -279,21 +237,9 @@ pub enum MaybeHttpsStream<T> {
     Https(SslStream<T>),
 }
 
-impl<T> Read for MaybeHttpsStream<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match *self {
-            MaybeHttpsStream::Http(ref mut s) => s.read(buf),
-            MaybeHttpsStream::Https(ref mut s) => s.read(buf),
-        }
-    }
-}
-
 impl<T> AsyncRead for MaybeHttpsStream<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
     unsafe fn prepare_uninitialized_buffer(&self, buf: &mut [u8]) -> bool {
         match *self {
@@ -302,54 +248,72 @@ where
         }
     }
 
-    fn read_buf<B>(&mut self, buf: &mut B) -> Poll<usize, io::Error>
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match *self {
+            MaybeHttpsStream::Http(ref mut s) => Pin::new(s).poll_read(cx, buf),
+            MaybeHttpsStream::Https(ref mut s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+
+    fn poll_read_buf<B: BufMut>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut B,
+    ) -> Poll<io::Result<usize>>
     where
         B: BufMut,
     {
         match *self {
-            MaybeHttpsStream::Http(ref mut s) => s.read_buf(buf),
-            MaybeHttpsStream::Https(ref mut s) => s.read_buf(buf),
-        }
-    }
-}
-
-impl<T> Write for MaybeHttpsStream<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match *self {
-            MaybeHttpsStream::Http(ref mut s) => s.write(buf),
-            MaybeHttpsStream::Https(ref mut s) => s.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match *self {
-            MaybeHttpsStream::Http(ref mut s) => s.flush(),
-            MaybeHttpsStream::Https(ref mut s) => s.flush(),
+            MaybeHttpsStream::Http(ref mut s) => Pin::new(s).poll_read_buf(cx, buf),
+            MaybeHttpsStream::Https(ref mut s) => Pin::new(s).poll_read_buf(cx, buf),
         }
     }
 }
 
 impl<T> AsyncWrite for MaybeHttpsStream<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         match *self {
-            MaybeHttpsStream::Http(ref mut s) => s.shutdown(),
-            MaybeHttpsStream::Https(ref mut s) => s.shutdown(),
+            MaybeHttpsStream::Http(ref mut s) => Pin::new(s).poll_write(cx, buf),
+            MaybeHttpsStream::Https(ref mut s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
-    fn write_buf<B>(&mut self, buf: &mut B) -> Poll<usize, io::Error>
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        match *self {
+            MaybeHttpsStream::Http(ref mut s) => Pin::new(s).poll_flush(cx),
+            MaybeHttpsStream::Https(ref mut s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        match *self {
+            MaybeHttpsStream::Http(ref mut s) => Pin::new(s).poll_shutdown(cx),
+            MaybeHttpsStream::Https(ref mut s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_buf<B: Buf>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut B,
+    ) -> Poll<io::Result<usize>>
     where
-        B: Buf,
+        Self: Sized,
     {
         match *self {
-            MaybeHttpsStream::Http(ref mut s) => s.write_buf(buf),
-            MaybeHttpsStream::Https(ref mut s) => s.write_buf(buf),
+            MaybeHttpsStream::Http(ref mut s) => Pin::new(s).poll_write_buf(cx, buf),
+            MaybeHttpsStream::Https(ref mut s) => Pin::new(s).poll_write_buf(cx, buf),
         }
     }
 }

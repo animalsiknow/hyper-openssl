@@ -1,7 +1,9 @@
-use futures::stream::Stream;
+use futures::future::{ready, FutureExt, TryFutureExt};
+use futures::stream::StreamExt;
 use hyper::client::HttpConnector;
 use hyper::{Body, Client};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use std::io::{Read, Write};
 use std::thread;
 use tokio::runtime::current_thread::Runtime;
 
@@ -10,7 +12,7 @@ use super::*;
 #[test]
 #[cfg(feature = "runtime")]
 fn google() {
-    let ssl = HttpsConnector::new(4).unwrap();
+    let ssl = HttpsConnector::new().unwrap();
     let client = Client::builder().keep_alive(false).build::<_, Body>(ssl);
 
     let mut runtime = Runtime::new().unwrap();
@@ -19,7 +21,7 @@ fn google() {
         .get("https://www.google.com".parse().unwrap())
         .and_then(|resp| {
             assert!(resp.status().is_success(), "{}", resp.status());
-            resp.into_body().for_each(|_| Ok(()))
+            resp.into_body().for_each(|_| ready(())).map(|()| Ok(()))
         });
     runtime.block_on(f).unwrap();
 
@@ -27,7 +29,7 @@ fn google() {
         .get("https://www.google.com".parse().unwrap())
         .and_then(|resp| {
             assert!(resp.status().is_success(), "{}", resp.status());
-            resp.into_body().for_each(|_| Ok(()))
+            resp.into_body().for_each(|_| ready(())).map(|()| Ok(()))
         });
     runtime.block_on(f).unwrap();
 
@@ -35,7 +37,7 @@ fn google() {
         .get("https://www.google.com".parse().unwrap())
         .and_then(|resp| {
             assert!(resp.status().is_success(), "{}", resp.status());
-            resp.into_body().for_each(|_| Ok(()))
+            resp.into_body().for_each(|_| ready(())).map(|()| Ok(()))
         });
     runtime.block_on(f).unwrap();
 }
@@ -69,7 +71,7 @@ fn localhost() {
         }
     });
 
-    let mut connector = HttpConnector::new(1);
+    let mut connector = HttpConnector::new();
     connector.enforce_http(false);
     let mut ssl = SslConnector::builder(SslMethod::tls()).unwrap();
     ssl.set_ca_file("test/cert.pem").unwrap();
@@ -95,7 +97,7 @@ fn localhost() {
             .get(format!("https://localhost:{}", port).parse().unwrap())
             .and_then(|resp| {
                 assert!(resp.status().is_success(), "{}", resp.status());
-                resp.into_body().for_each(|_| Ok(()))
+                resp.into_body().for_each(|_| ready(())).map(|()| Ok(()))
             });
         runtime.block_on(f).unwrap();
     }
@@ -106,15 +108,15 @@ fn localhost() {
 #[test]
 #[cfg(ossl102)]
 fn alpn_h2() {
-    use futures::future;
     use hyper::server::conn::Http;
     use hyper::service;
     use hyper::Response;
     use openssl::ssl::{self, AlpnError};
     use tokio::net::TcpListener;
-    use tokio_openssl::SslAcceptorExt;
 
-    let mut listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut runtime = Runtime::new().unwrap();
+
+    let mut listener = runtime.block_on(TcpListener::bind(&"127.0.0.1:0")).unwrap();
     let port = listener.local_addr().unwrap().port();
 
     let mut ctx = SslAcceptor::mozilla_modern(SslMethod::tls()).unwrap();
@@ -126,27 +128,23 @@ fn alpn_h2() {
     });
     let ctx = ctx.build();
 
-    let server = future::poll_fn(move || listener.poll_accept())
-        .map_err(|e| panic!("tcp accept error: {}", e))
-        .and_then(move |(stream, _)| ctx.accept_async(stream))
-        .map_err(|e| panic!("tls accept error: {}", e))
-        .and_then(|stream| {
-            assert_eq!(
-                stream.get_ref().ssl().selected_alpn_protocol().unwrap(),
-                b"h2"
-            );
+    runtime.spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("tcp accept error");
+            let stream = tokio_openssl::accept(&ctx, stream).await.expect("tls accept error");
+            assert_eq!(stream.ssl().selected_alpn_protocol().unwrap(), b"h2");
             Http::new().http2_only(true).serve_connection(
                 stream,
-                service::service_fn_ok(|_| Response::new(Body::empty())),
-            )
-        })
-        .map(|_| ())
-        .map_err(|e| panic!("http error: {}", e));
+                service::service_fn(|_| {
+                    ready(Result::<_, Box<dyn Error + Send + Sync>>::Ok(
+                        Response::new(Body::empty()),
+                    ))
+                }),
+            ).await.expect("http error");
+        }
+    });
 
-    let mut runtime = Runtime::new().unwrap();
-    runtime.spawn(server);
-
-    let mut connector = HttpConnector::new(1);
+    let mut connector = HttpConnector::new();
     connector.enforce_http(false);
     let mut ssl = SslConnector::builder(SslMethod::tls()).unwrap();
     ssl.set_ca_file("test/cert.pem").unwrap();
@@ -159,10 +157,7 @@ fn alpn_h2() {
         .get(format!("https://localhost:{}", port).parse().unwrap())
         .and_then(|resp| {
             assert!(resp.status().is_success(), "{}", resp.status());
-            resp.into_body().for_each(|_| Ok(()))
+            resp.into_body().for_each(|_| ready(())).map(|()| Ok(()))
         });
     runtime.block_on(f).unwrap();
-    drop(client);
-
-    runtime.run().unwrap();
 }

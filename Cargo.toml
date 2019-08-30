@@ -7,6 +7,7 @@ license = "MIT/Apache-2.0"
 repository = "https://github.com/sfackler/hyper-openssl"
 readme = "README.md"
 exclude = ["test/*"]
+edition = "2018"
 
 [features]
 default = ["runtime"]
@@ -16,15 +17,15 @@ runtime = ["hyper/runtime"]
 [dependencies]
 antidote = "1.0.0"
 bytes = "0.4"
-hyper = { version = "0.12.14", default-features = false }
+hyper = { git = "https://github.com/hyperium/hyper.git", default-features = false }
 lazy_static = "1.0"
 linked_hash_set = "0.1"
 openssl = "0.10.19"
 openssl-sys = "0.9.26"
-tokio-io = "0.1.2"
-tokio-openssl = "0.3"
-futures = "0.1.14"
+tokio-io = "0.2.0-alpha.4"
+tokio-openssl = "0.4.0-alpha.4"
+futures-preview = "0.3.0-alpha.18"
 
 [dev-dependencies]
-hyper = "0.12"
-tokio = "0.1"
+hyper = { git = "https://github.com/hyperium/hyper.git" }
+tokio = "0.2.0-alpha.4"
